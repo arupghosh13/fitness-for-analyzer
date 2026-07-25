@@ -6,6 +6,7 @@ once this is deployed to a browser, not just on localhost.
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 # Ensure the project root (the folder containing src/) is on sys.path.
@@ -19,6 +20,7 @@ import cv2
 import streamlit as st
 from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
+from src.app.video_batch_processor import process_video
 from src.core.form_analyzer import FormAnalyzer
 from src.exercises.bicep_curl import BicepCurl
 from src.exercises.pushup import Pushup
@@ -27,6 +29,7 @@ from src.feedback.audio_feedback import AudioFeedback
 from src.feedback.visual_feedback import render_overlay
 from src.pose_estimation.pose_detector import PoseDetectionError, PoseDetector
 from src.utils.config import config
+from src.utils.ice_servers import get_ice_servers
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -36,11 +39,6 @@ EXERCISES = {
     "Push-up": Pushup,
     "Bicep Curl": BicepCurl,
 }
-
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
-
 
 ROTATION_OPTIONS = {
     "No rotation": None,
@@ -97,31 +95,32 @@ class FitnessProcessor(VideoProcessorBase):
         result = self.pose_detector.detect(img)
         if result is not None:
             img = self.pose_detector.draw_landmarks(img, result)
-            try:
-                # process() and analyze() are both safe -- they never raise
-                # on bad/low-visibility landmarks, they just skip the frame
-                # internally. We never call get_primary_angle() directly
-                # here, since that CAN raise LowVisibilityError; doing so
-                # unguarded is what caused the video to freeze on any frame
-                # with uncertain tracking.
-                rep_event = self.exercise.process(result.landmarks)
-                feedback = self.form_analyzer.analyze(self.exercise.name, result.landmarks)
 
+            # Rep counting and form analysis are independent concerns (a
+            # rep can complete with bad form, or fail to complete with
+            # good form) -- separate try/except blocks so a failure in one
+            # never silently discards an already-successful result from
+            # the other. We never call get_primary_angle() directly here
+            # either, since that CAN raise LowVisibilityError; doing so
+            # unguarded is what originally caused the video to freeze.
+            try:
+                rep_event = self.exercise.process(result.landmarks)
                 current_angle = self.exercise.current_angle
+                self.last_rep_count = rep_event.count
                 if current_angle is not None:
                     self.last_angle = current_angle
-                self.last_rep_count = rep_event.count
-                self.last_feedback = feedback
+            except Exception as exc:
+                logger.warning("Rep counting failed: %s", exc)
 
-                if self.audio is not None and feedback:
-                    for message in feedback:
+            try:
+                self.last_feedback = self.form_analyzer.analyze(
+                    self.exercise.name, result.landmarks
+                )
+                if self.audio is not None and self.last_feedback:
+                    for message in self.last_feedback:
                         self.audio.announce(message)
             except Exception as exc:
-                # Defense in depth: NOTHING in this per-frame block should
-                # ever be able to freeze the video feed. If something
-                # unexpected still goes wrong, log it and keep showing the
-                # last known-good overlay instead of crashing the stream.
-                logger.warning("Skipping frame due to processing error: %s", exc)
+                logger.warning("Form analysis failed: %s", exc)
 
         img = render_overlay(
             img,
@@ -142,22 +141,80 @@ def main() -> None:
 
     st.sidebar.header("Settings")
     exercise_name = st.sidebar.selectbox("Exercise", list(EXERCISES.keys()))
-    rotation_label = st.sidebar.selectbox("Camera rotation", list(ROTATION_OPTIONS.keys()))
-    rotation_value = ROTATION_OPTIONS[rotation_label]
-    st.sidebar.markdown(
-        "Stand side-on to the camera so your full body is visible in frame. "
-        "If your phone camera (e.g. via DroidCam) appears sideways, use the "
-        "rotation setting above until the video looks upright."
-    )
+    input_mode = st.sidebar.radio("Input source", ["Live Webcam", "Upload Recorded Video"])
 
-    # Re-keying by exercise_name AND rotation forces a fresh processor
-    # whenever either setting changes.
-    webrtc_streamer(
-        key=f"fitness-corrector-{exercise_name}-{rotation_label}",
-        video_processor_factory=lambda: FitnessProcessor(exercise_name, rotation_value),
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
-    )
+    if input_mode == "Live Webcam":
+        rotation_label = st.sidebar.selectbox(
+            "Camera rotation", list(ROTATION_OPTIONS.keys())
+        )
+        rotation_value = ROTATION_OPTIONS[rotation_label]
+        st.sidebar.markdown(
+            "Stand side-on to the camera so your full body is visible in frame. "
+            "If your phone camera (e.g. via DroidCam) appears sideways, use the "
+            "rotation setting above until the video looks upright."
+        )
+
+        # Cached so we don't re-fetch a new Twilio token on every Streamlit
+        # rerun (e.g. every time a widget changes) -- one token per session
+        # is enough.
+        ice_servers = st.cache_data(get_ice_servers)()
+        rtc_configuration = RTCConfiguration({"iceServers": ice_servers})
+
+        # Re-keying by exercise_name AND rotation forces a fresh processor
+        # whenever either setting changes.
+        webrtc_streamer(
+            key=f"fitness-corrector-{exercise_name}-{rotation_label}",
+            video_processor_factory=lambda: FitnessProcessor(exercise_name, rotation_value),
+            rtc_configuration=rtc_configuration,
+            media_stream_constraints={"video": True, "audio": False},
+        )
+    else:
+        st.markdown(
+            "Upload a recorded video to analyze it frame by frame. This can be "
+            "more accurate than the live webcam: no live streaming compression "
+            "artifacts (e.g. from DroidCam's WiFi feed), and no frames are "
+            "skipped to keep up with real time."
+        )
+        uploaded_file = st.file_uploader(
+            "Choose a video file", type=["mp4", "mov", "avi", "mkv"]
+        )
+
+        if uploaded_file is not None and st.button("Process Video"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                input_path = str(Path(tmpdir) / uploaded_file.name)
+                output_path = str(Path(tmpdir) / "annotated_output.mp4")
+
+                with open(input_path, "wb") as f:
+                    f.write(uploaded_file.read())
+
+                with st.spinner(
+                    "Processing video... this can take a while depending on length."
+                ):
+                    try:
+                        final_count = process_video(input_path, output_path, exercise_name)
+                    except PoseDetectionError as exc:
+                        st.error(f"Pose model error: {exc}")
+                        return
+                    except (FileNotFoundError, IOError, ValueError) as exc:
+                        st.error(f"Could not process video: {exc}")
+                        return
+
+                # Read the output into memory BEFORE the temp directory is
+                # cleaned up (it's deleted as soon as this `with` block
+                # ends), so st.video()/download_button() below always have
+                # valid bytes to work with, regardless of when Streamlit
+                # actually renders them.
+                with open(output_path, "rb") as f:
+                    video_bytes = f.read()
+
+            st.success(f"Done! Final rep count: {final_count}")
+            st.video(video_bytes)
+            st.download_button(
+                "Download annotated video",
+                data=video_bytes,
+                file_name="annotated_output.mp4",
+                mime="video/mp4",
+            )
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
