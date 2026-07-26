@@ -35,11 +35,28 @@ class LowVisibilityError(Exception):
     tracked in the current frame (camera warming up, limb occluded, etc.)."""
 
 
+def landmarks_are_visible(min_visibility: float, *landmarks: Landmark) -> bool:
+    """Non-raising visibility check. Used to decide WHICH side (left or
+    right) to track this frame, before committing to it -- unlike the
+    raising check, this never throws, so it's safe to use for a left/right
+    decision without needing a try/except around every attempt."""
+    return all(lm.visibility >= min_visibility for lm in landmarks)
+
+
 class BaseExercise(ABC):
     """Base class for a trackable exercise.
 
     Subclasses define which joint angle drives rep counting and the
     up/down thresholds for that angle.
+
+    Bilateral tracking: subclasses should check BOTH the left and right
+    side landmarks and use whichever side is currently more confidently
+    tracked (see Squat/Pushup/BicepCurl for the pattern), rather than
+    hardcoding one side. This makes tracking robust to which side of the
+    body the camera happens to see clearly. Note this picks one side per
+    frame for a single tracked angle -- it does not independently track
+    alternating single-arm movements (e.g. alternating single-arm curls)
+    as two separate rep counts.
     """
 
     name: str
@@ -61,16 +78,22 @@ class BaseExercise(ABC):
     def get_primary_angle(self, landmarks: list[Landmark]) -> float:
         """Return the joint angle (degrees) that drives rep counting.
 
-        Implementations should call `self._check_visibility(...)` on the
-        landmarks they use, and let LowVisibilityError propagate -- process()
-        catches it and skips the frame rather than counting on bad data.
+        Implementations should try the left side via `self._is_visible(...)`,
+        fall back to the right side the same way, and raise
+        LowVisibilityError only if neither side is confidently tracked --
+        process() catches that and skips the frame rather than counting on
+        bad data.
         """
         raise NotImplementedError
 
+    def _is_visible(self, *landmarks: Landmark) -> bool:
+        """Non-raising visibility check using this exercise's own
+        threshold. Use this to decide which side (left/right) to track."""
+        return landmarks_are_visible(self.min_landmark_visibility, *landmarks)
+
     def _check_visibility(self, *landmarks: Landmark) -> None:
         """Raise LowVisibilityError if any given landmark isn't confidently
-        tracked (using this exercise's own threshold). Call this at the
-        top of get_primary_angle()."""
+        tracked (using this exercise's own threshold)."""
         for lm in landmarks:
             if lm.visibility < self.min_landmark_visibility:
                 raise LowVisibilityError(

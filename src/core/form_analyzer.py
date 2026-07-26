@@ -6,6 +6,7 @@ callers should treat that as the success case, not as "no data".
 from __future__ import annotations
 
 from collections import deque
+from typing import Optional
 
 from src.core.angle_calculator import calculate_angle
 from src.exercises.base_exercise import (
@@ -15,6 +16,14 @@ from src.exercises.base_exercise import (
     LEFT_KNEE,
     LEFT_SHOULDER,
     LEFT_WRIST,
+    MIN_LANDMARK_VISIBILITY,
+    RIGHT_ANKLE,
+    RIGHT_ELBOW,
+    RIGHT_HIP,
+    RIGHT_KNEE,
+    RIGHT_SHOULDER,
+    RIGHT_WRIST,
+    landmarks_are_visible,
 )
 from src.pose_estimation.pose_detector import Landmark
 
@@ -48,7 +57,28 @@ FEEDBACK_TRIGGER_MAJORITY = 3
 # Below this torso length (normalized coords), the person is too small/far
 # in frame for distance-ratio checks to be reliable -- skip those rules
 # rather than risk a division-by-near-zero blowup.
+# Matches BicepCurl's own min_landmark_visibility override (see
+# bicep_curl.py for why: wrist/elbow tracking during a curl is naturally
+# less confident than the joints other exercises rely on). Using the
+# stricter global default here would silence curl form feedback even
+# while rep counting (which uses this same lower threshold) keeps working.
+CURL_MIN_VISIBILITY = 0.3
+
 MIN_TORSO_LENGTH_FOR_RATIO_CHECKS = 0.05
+
+
+def _select_side(
+    left: tuple[Landmark, ...], right: tuple[Landmark, ...]
+) -> Optional[tuple[Landmark, ...]]:
+    """Return whichever side's landmarks are ALL confidently tracked
+    together (never mixing a left landmark with a right one), preferring
+    left. Returns None if neither side is fully visible -- callers should
+    skip form checks for that frame rather than compute on unreliable data."""
+    if landmarks_are_visible(MIN_LANDMARK_VISIBILITY, *left):
+        return left
+    if landmarks_are_visible(MIN_LANDMARK_VISIBILITY, *right):
+        return right
+    return None
 
 
 class FormAnalyzer:
@@ -67,7 +97,7 @@ class FormAnalyzer:
 
         return self._smooth(raw_flags)
 
-    def _smooth(self, raw_flags: dict[str, bool]) -> list[str]:
+    def _smooth(self, raw_flags: dict[str, tuple[bool, str]]) -> list[str]:
         """Only surface a warning if it triggered on a majority of the last
         few frames -- absorbs single-frame jitter without adding much lag."""
         feedback: list[str] = []
@@ -84,10 +114,18 @@ class FormAnalyzer:
         self._history.clear()
 
     def _check_squat(self, landmarks: list[Landmark]) -> dict[str, tuple[bool, str]]:
-        hip = landmarks[LEFT_HIP]
-        knee = landmarks[LEFT_KNEE]
-        ankle = landmarks[LEFT_ANKLE]
-        shoulder = landmarks[LEFT_SHOULDER]
+        left = (
+            landmarks[LEFT_HIP], landmarks[LEFT_KNEE],
+            landmarks[LEFT_ANKLE], landmarks[LEFT_SHOULDER],
+        )
+        right = (
+            landmarks[RIGHT_HIP], landmarks[RIGHT_KNEE],
+            landmarks[RIGHT_ANKLE], landmarks[RIGHT_SHOULDER],
+        )
+        side = _select_side(left, right)
+        if side is None:
+            return {}  # can't confidently assess form this frame
+        hip, knee, ankle, shoulder = side
         torso_length = _distance(hip, shoulder)
 
         flags: dict[str, tuple[bool, str]] = {}
@@ -111,9 +149,12 @@ class FormAnalyzer:
         return flags
 
     def _check_pushup(self, landmarks: list[Landmark]) -> dict[str, tuple[bool, str]]:
-        shoulder = landmarks[LEFT_SHOULDER]
-        hip = landmarks[LEFT_HIP]
-        ankle = landmarks[LEFT_ANKLE]
+        left = (landmarks[LEFT_SHOULDER], landmarks[LEFT_HIP], landmarks[LEFT_ANKLE])
+        right = (landmarks[RIGHT_SHOULDER], landmarks[RIGHT_HIP], landmarks[RIGHT_ANKLE])
+        side = _select_side(left, right)
+        if side is None:
+            return {}
+        shoulder, hip, ankle = side
 
         plank_angle = calculate_angle(shoulder, hip, ankle)
         return {
@@ -124,9 +165,15 @@ class FormAnalyzer:
         }
 
     def _check_bicep_curl(self, landmarks: list[Landmark]) -> dict[str, tuple[bool, str]]:
-        shoulder = landmarks[LEFT_SHOULDER]
-        elbow = landmarks[LEFT_ELBOW]
-        hip = landmarks[LEFT_HIP]
+        left = (landmarks[LEFT_SHOULDER], landmarks[LEFT_ELBOW], landmarks[LEFT_HIP])
+        right = (landmarks[RIGHT_SHOULDER], landmarks[RIGHT_ELBOW], landmarks[RIGHT_HIP])
+        if landmarks_are_visible(CURL_MIN_VISIBILITY, *left):
+            side = left
+        elif landmarks_are_visible(CURL_MIN_VISIBILITY, *right):
+            side = right
+        else:
+            return {}
+        shoulder, elbow, hip = side
         torso_length = _distance(hip, shoulder)
 
         if torso_length < MIN_TORSO_LENGTH_FOR_RATIO_CHECKS:

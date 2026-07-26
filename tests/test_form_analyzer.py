@@ -57,6 +57,34 @@ class TestFormAnalyzerSquat(unittest.TestCase):
         feedback = repeat_analyze(self.analyzer, "Not A Real Exercise", landmarks)
         self.assertEqual(feedback, [])
 
+    def test_falls_back_to_right_side_when_left_is_not_visible(self):
+        from src.exercises.base_exercise import (
+            RIGHT_ANKLE, RIGHT_HIP, RIGHT_KNEE, RIGHT_SHOULDER,
+        )
+        from src.pose_estimation.pose_detector import Landmark
+
+        landmarks = [Landmark(x=0, y=0, z=0, visibility=0.0) for _ in range(29)]
+        # Left side present but not confidently tracked
+        landmarks[LEFT_HIP] = Landmark(x=9, y=9, z=0, visibility=0.1)
+        landmarks[LEFT_KNEE] = Landmark(x=9, y=9, z=0, visibility=0.1)
+        landmarks[LEFT_ANKLE] = Landmark(x=9, y=9, z=0, visibility=0.1)
+        landmarks[LEFT_SHOULDER] = Landmark(x=9, y=9, z=0, visibility=0.1)
+        # Right side clearly visible, good form (upright, no knee-over-toe)
+        landmarks[RIGHT_HIP] = Landmark(x=0, y=2, z=0, visibility=1.0)
+        landmarks[RIGHT_KNEE] = Landmark(x=0, y=3, z=0, visibility=1.0)
+        landmarks[RIGHT_ANKLE] = Landmark(x=0, y=4, z=0, visibility=1.0)
+        landmarks[RIGHT_SHOULDER] = Landmark(x=0, y=1, z=0, visibility=1.0)
+
+        feedback = repeat_analyze(self.analyzer, "Squat", landmarks)
+        self.assertEqual(feedback, [])  # right side shows good form -> no warnings
+
+    def test_neither_side_visible_returns_no_feedback_not_a_crash(self):
+        from src.pose_estimation.pose_detector import Landmark
+
+        landmarks = [Landmark(x=0, y=0, z=0, visibility=0.05) for _ in range(29)]
+        feedback = repeat_analyze(self.analyzer, "Squat", landmarks)
+        self.assertEqual(feedback, [])  # no data confidently available -> no claims made
+
     def test_single_noisy_frame_does_not_trigger_feedback(self):
         # A single bad-form frame among otherwise-good frames should NOT
         # flicker the warning on -- this is the flicker-fix regression test.
