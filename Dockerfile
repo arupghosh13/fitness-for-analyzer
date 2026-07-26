@@ -1,9 +1,14 @@
 FROM python:3.12-slim
 
-# System deps required by OpenCV/MediaPipe/streamlit-webrtc (av/ffmpeg)
+# System deps required by OpenCV/MediaPipe/streamlit-webrtc (av/ffmpeg).
+# libgles2 + libegl1 fix a common MediaPipe-on-slim-Linux error:
+# "libGLESv2.so.2: cannot open shared object file" -- MediaPipe's backend
+# touches OpenGL ES libraries even when no GPU rendering is actually used.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
+    libgles2 \
+    libegl1 \
     ffmpeg \
     curl \
     && rm -rf /var/lib/apt/lists/*
